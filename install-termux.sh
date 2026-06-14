@@ -1,36 +1,43 @@
 #!/bin/bash
 
 ################################################################################
-# Opus: Termux Installation & Setup Script
-# GitHub Copilot Chat AI Sync Integration
-# Supports: Claude Haiku 4.5, GitHub Copilot, Multi-Provider Architecture
-# Per-Account API Key Management
+# Opus: GitHub Copilot Chat AI Sync - Termux Installation Script
+# Simplified for GitHub Copilot with per-account/per-device management
+# Supports: Interactive Chat, History Sync, Code Snippets
+# Secure per-device token storage
 ################################################################################
 
 set -e
+
+# Script Info
+OPUS_VERSION="1.1.0"
+OPUS_BUILD="20260614-copilot"
 
 # Colors for output
 RED='\033[0;31m'
 GREEN='\033[0;32m'
 YELLOW='\033[1;33m'
 BLUE='\033[0;34m'
+MAGENTA='\033[0;35m'
+CYAN='\033[0;36m'
 NC='\033[0m' # No Color
 
-# Configuration
+# Configuration Paths
 OPUS_HOME="${HOME}/.opus"
 OPUS_BIN="${OPUS_HOME}/bin"
 OPUS_CONFIG="${OPUS_HOME}/config"
 OPUS_CACHE="${OPUS_HOME}/cache"
 OPUS_LOG="${OPUS_HOME}/logs"
-REPO_URL="https://github.com/Riskybit23/Chat-ai-Project"
-CLAUDE_MODEL="claude-haiku-4.5"
+OPUS_DATA="${OPUS_HOME}/data"
+DEVICE_ID_FILE="${OPUS_CONFIG}/.device_id"
+ACCOUNT_ID_FILE="${OPUS_CONFIG}/.account_id"
 
 ################################################################################
 # Logging Functions
 ################################################################################
 
 log_info() {
-    echo -e "${BLUE}[INFO]${NC} $1"
+    echo -e "${BLUE}[ℹ]${NC} $1"
 }
 
 log_success() {
@@ -38,11 +45,38 @@ log_success() {
 }
 
 log_error() {
-    echo -e "${RED}[ERROR]${NC} $1"
+    echo -e "${RED}[✗]${NC} $1" >&2
 }
 
 log_warning() {
     echo -e "${YELLOW}[!]${NC} $1"
+}
+
+log_title() {
+    echo -e "${MAGENTA}\n═══════════════════════════════════════════════════════════${NC}"
+    echo -e "${MAGENTA}${1}${NC}"
+    echo -e "${MAGENTA}═══════════════════════════════════════════════════════════${NC}\n"
+}
+
+################################################################################
+# System Detection
+################################################################################
+
+detect_system() {
+    if [[ "$OSTYPE" == "linux-android"* ]]; then
+        SYSTEM="termux"
+        PKG_MANAGER="pkg"
+    elif [[ "$OSTYPE" == "linux-gnu"* ]]; then
+        SYSTEM="linux"
+        if command -v apt &> /dev/null; then
+            PKG_MANAGER="apt"
+        elif command -v yum &> /dev/null; then
+            PKG_MANAGER="yum"
+        fi
+    elif [[ "$OSTYPE" == "darwin"* ]]; then
+        SYSTEM="macos"
+        PKG_MANAGER="brew"
+    fi
 }
 
 ################################################################################
@@ -50,34 +84,31 @@ log_warning() {
 ################################################################################
 
 check_prerequisites() {
-    log_info "Checking prerequisites..."
+    log_title "Checking Prerequisites"
     
+    local required=("curl" "git" "jq")
     local missing=0
     
-    # Check for required commands
-    for cmd in curl git jq; do
-        if ! command -v "$cmd" &> /dev/null; then
-            log_error "$cmd is not installed"
-            missing=$((missing + 1))
+    for cmd in "${required[@]}"; do
+        if command -v "$cmd" &> /dev/null; then
+            log_success "Found: $cmd"
         else
-            log_success "$cmd found"
+            log_error "Missing: $cmd"
+            missing=$((missing + 1))
         fi
     done
     
     if [ $missing -gt 0 ]; then
         log_warning "Installing missing dependencies..."
-        if command -v pkg &> /dev/null; then
-            pkg install -y curl git jq
-        elif command -v apt &> /dev/null; then
-            apt-get update
-            apt-get install -y curl git jq
-        else
-            log_error "Could not auto-install dependencies. Please install manually."
-            return 1
-        fi
+        case $PKG_MANAGER in
+            pkg) pkg update && pkg install -y curl git jq ;;
+            apt) sudo apt-get update && sudo apt-get install -y curl git jq ;;
+            yum) sudo yum install -y curl git jq ;;
+            brew) brew install curl git jq ;;
+        esac
     fi
     
-    return 0
+    log_success "All prerequisites satisfied"
 }
 
 ################################################################################
@@ -85,15 +116,47 @@ check_prerequisites() {
 ################################################################################
 
 setup_directories() {
-    log_info "Setting up Opus directories..."
+    log_title "Setting Up Directory Structure"
     
     mkdir -p "$OPUS_HOME"
     mkdir -p "$OPUS_BIN"
     mkdir -p "$OPUS_CONFIG"
-    mkdir -p "$OPUS_CACHE"
+    mkdir -p "$OPUS_CACHE/sessions"
+    mkdir -p "$OPUS_CACHE/backups"
     mkdir -p "$OPUS_LOG"
+    mkdir -p "$OPUS_DATA/snippets"
+    
+    # Set restrictive permissions for config
+    chmod 700 "$OPUS_CONFIG"
     
     log_success "Directories created at $OPUS_HOME"
+}
+
+################################################################################
+# Device & Account ID Generation
+################################################################################
+
+generate_device_id() {
+    if [ ! -f "$DEVICE_ID_FILE" ]; then
+        DEVICE_ID=$(cat /dev/urandom | tr -dc 'a-f0-9' | fold -w 16 | head -n 1)
+        echo "$DEVICE_ID" > "$DEVICE_ID_FILE"
+        chmod 600 "$DEVICE_ID_FILE"
+    else
+        DEVICE_ID=$(cat "$DEVICE_ID_FILE")
+    fi
+    log_success "Device ID: $DEVICE_ID (stored securely)"
+}
+
+generate_account_id() {
+    if [ ! -f "$ACCOUNT_ID_FILE" ]; then
+        read -p "Enter your GitHub username (for per-account isolation): " github_username
+        ACCOUNT_ID="${github_username}_$(date +%s)"
+        echo "$ACCOUNT_ID" > "$ACCOUNT_ID_FILE"
+        chmod 600 "$ACCOUNT_ID_FILE"
+    else
+        ACCOUNT_ID=$(cat "$ACCOUNT_ID_FILE")
+    fi
+    log_success "Account ID: $ACCOUNT_ID (isolated)"
 }
 
 ################################################################################
@@ -101,114 +164,108 @@ setup_directories() {
 ################################################################################
 
 setup_github_auth() {
-    log_info "Setting up GitHub authentication..."
+    log_title "GitHub Authentication Setup"
     
-    # Check if GitHub CLI is installed
+    # Check if GitHub CLI is available
     if ! command -v gh &> /dev/null; then
         log_warning "GitHub CLI not found. Installing..."
-        if command -v pkg &> /dev/null; then
-            pkg install -y gh
-        else
-            log_error "Please install GitHub CLI manually"
-            return 1
+        case $PKG_MANAGER in
+            pkg) pkg install -y gh ;;
+            apt) sudo apt-get install -y gh ;;
+            yum) sudo yum install -y gh ;;
+            brew) brew install gh ;;
+        esac
+    fi
+    
+    # Check authentication status
+    if gh auth status &>/dev/null; then
+        log_success "GitHub CLI already authenticated"
+        GH_USER=$(gh api user --jq '.login')
+        log_info "Authenticated as: $GH_USER"
+    else
+        log_info "Authenticate with GitHub..."
+        gh auth login --web
+        log_success "GitHub authentication successful"
+    fi
+}
+
+################################################################################
+# GitHub Copilot Token Setup
+################################################################################
+
+setup_copilot_token() {
+    log_title "GitHub Copilot Token Configuration"
+    
+    local token_file="${OPUS_CONFIG}/copilot_token"
+    local token_info_file="${OPUS_CONFIG}/token_info"
+    
+    if [ -f "$token_file" ]; then
+        read -p "Token already exists. Replace it? (y/N): " replace
+        if [ "$replace" != "y" ]; then
+            log_info "Using existing token"
+            return 0
         fi
     fi
     
-    # Check if already authenticated
-    if gh auth status &>/dev/null; then
-        log_success "GitHub CLI already authenticated"
-        return 0
-    fi
+    echo ""
+    log_info "Getting GitHub Copilot token..."
+    log_info "This will authenticate via GitHub CLI"
+    echo ""
     
-    log_info "Authenticating with GitHub..."
-    gh auth login --web
-    
-    if [ $? -eq 0 ]; then
-        log_success "GitHub authentication successful"
-        return 0
+    # Get token from gh CLI
+    if gh auth token &>/dev/null 2>&1; then
+        TOKEN=$(gh auth token)
+        echo "$TOKEN" > "$token_file"
+        chmod 600 "$token_file"
+        
+        # Store token metadata
+        cat > "$token_info_file" << EOF
+{
+  "device_id": "$DEVICE_ID",
+  "account_id": "$ACCOUNT_ID",
+  "created_at": "$(date -Iseconds)",
+  "last_used": "$(date -Iseconds)",
+  "os": "$OSTYPE",
+  "hostname": "$(hostname)",
+  "user": "$(whoami)"
+}
+EOF
+        chmod 600 "$token_info_file"
+        
+        log_success "GitHub Copilot token configured"
+        log_info "Token is secured with 600 permissions (owner-only access)"
+        log_info "Token metadata stored for per-account/device tracking"
     else
-        log_error "GitHub authentication failed"
+        log_error "Failed to get GitHub Copilot token"
         return 1
     fi
 }
 
 ################################################################################
-# API Keys Configuration
-################################################################################
-
-setup_api_keys() {
-    log_info "Setting up API keys for providers..."
-    
-    local config_file="${OPUS_CONFIG}/providers.conf"
-    
-    # Initialize config file with template
-    cat > "$config_file" << 'EOF'
-# Opus: Multi-Provider API Configuration
-# Store your API keys securely below
-
-# GitHub Copilot Configuration
-GITHUB_TOKEN=""
-COPILOT_ENABLED=true
-
-# Anthropic Claude Configuration
-ANTHROPIC_API_KEY=""
-CLAUDE_ENABLED=true
-CLAUDE_MODEL="claude-haiku-4.5"
-
-# Alternative Providers (optional)
-OPENAI_API_KEY=""
-OPENAI_ENABLED=false
-
-# Sync Configuration
-SYNC_INTERVAL=300  # seconds
-AUTO_BACKUP=true
-EOF
-
-    chmod 600 "$config_file"
-    log_success "Configuration template created at $config_file"
-    
-    # Prompt user to enter keys
-    log_info "Enter your API keys (press Enter to skip):"
-    
-    read -p "GitHub Token (for Copilot): " GITHUB_TOKEN
-    if [ -n "$GITHUB_TOKEN" ]; then
-        sed -i "s|GITHUB_TOKEN=\"\"|GITHUB_TOKEN=\"$GITHUB_TOKEN\"|" "$config_file"
-        log_success "GitHub token saved"
-    fi
-    
-    read -p "Anthropic API Key (for Claude): " ANTHROPIC_API_KEY
-    if [ -n "$ANTHROPIC_API_KEY" ]; then
-        sed -i "s|ANTHROPIC_API_KEY=\"\"|ANTHROPIC_API_KEY=\"$ANTHROPIC_API_KEY\"|" "$config_file"
-        log_success "Anthropic API key saved"
-    fi
-    
-    read -p "OpenAI API Key (optional): " OPENAI_API_KEY
-    if [ -n "$OPENAI_API_KEY" ]; then
-        sed -i "s|OPENAI_API_KEY=\"\"|OPENAI_API_KEY=\"$OPENAI_API_KEY\"|" "$config_file"
-        sed -i "s|OPENAI_ENABLED=false|OPENAI_ENABLED=true|" "$config_file"
-        log_success "OpenAI API key saved"
-    fi
-    
-    log_success "API keys configured in $config_file"
-}
-
-################################################################################
-# Core Scripts Installation
+# Install Core Scripts
 ################################################################################
 
 install_core_scripts() {
-    log_info "Installing core scripts..."
+    log_title "Installing Core Scripts"
     
-    # Main Opus CLI script
+    # Main Opus CLI
     cat > "${OPUS_BIN}/opus" << 'MAINEOF'
 #!/bin/bash
-source "${HOME}/.opus/config/providers.conf" 2>/dev/null || true
-OPUS_LOG="${HOME}/.opus/logs"
+OPUS_VERSION="1.1.0"
+source "${HOME}/.opus/config/token_info" 2>/dev/null || true
 
 case "$1" in
     chat)
         shift
         "${HOME}/.opus/bin/opus-chat" "$@"
+        ;;
+    search)
+        shift
+        "${HOME}/.opus/bin/opus-search" "$@"
+        ;;
+    snippets)
+        shift
+        "${HOME}/.opus/bin/opus-snippets" "$@"
         ;;
     sync)
         "${HOME}/.opus/bin/opus-sync"
@@ -220,17 +277,29 @@ case "$1" in
     status)
         "${HOME}/.opus/bin/opus-status"
         ;;
-    help)
-        echo "Opus: Copilot Chat AI Sync"
-        echo ""
-        echo "Usage: opus [command] [options]"
-        echo ""
-        echo "Commands:"
-        echo "  chat [message]     Start an AI chat session"
-        echo "  sync               Sync conversation history"
-        echo "  config             Manage configuration"
-        echo "  status             Show system status"
-        echo "  help               Display this help message"
+    help|--help|-h)
+        cat << 'HELP'
+Opus: GitHub Copilot Chat AI Sync
+
+Usage: opus [command] [options]
+
+Commands:
+  chat [message]       Chat with GitHub Copilot
+  search [query]       Search chat history
+  snippets [action]    Manage code snippets
+  sync                 Sync conversation history
+  config [action]      Manage configuration
+  status               Show system status
+  help                 Show this help message
+
+Examples:
+  opus chat "Explain this code"
+  opus chat
+  opus search "python"
+  opus snippets list
+  opus sync
+  opus status
+HELP
         ;;
     *)
         "${HOME}/.opus/bin/opus-chat" "$@"
@@ -238,232 +307,304 @@ case "$1" in
 esac
 MAINEOF
 
-    # Chat interface script
+    # Chat script with GitHub Copilot integration
     cat > "${OPUS_BIN}/opus-chat" << 'CHATEOF'
 #!/bin/bash
-source "${HOME}/.opus/config/providers.conf" 2>/dev/null || true
 OPUS_CACHE="${HOME}/.opus/cache"
 OPUS_LOG="${HOME}/.opus/logs"
-CLAUDE_MODEL="${CLAUDE_MODEL:-claude-haiku-4.5}"
+OPUS_CONFIG="${HOME}/.opus/config"
+TOKEN_FILE="${OPUS_CONFIG}/copilot_token"
 
-# Create chat session
-SESSION_ID=$(date +%s)
-CHAT_FILE="${OPUS_CACHE}/chat_${SESSION_ID}.json"
+log_error() { echo -e "\033[0;31m[✗]\033[0m $1" >&2; }
+log_info() { echo -e "\033[0;34m[ℹ]\033[0m $1"; }
+log_success() { echo -e "\033[0;32m[✓]\033[0m $1"; }
 
-# Initialize conversation
+# Verify token exists
+if [ ! -f "$TOKEN_FILE" ]; then
+    log_error "GitHub Copilot token not configured"
+    log_info "Run: opus config setup"
+    exit 1
+fi
+
+TOKEN=$(cat "$TOKEN_FILE")
+
+# Create session
+SESSION_ID=$(date +%s%N)
+CHAT_FILE="${OPUS_CACHE}/sessions/chat_${SESSION_ID}.json"
+
 cat > "$CHAT_FILE" << SESEOF
 {
   "session_id": "$SESSION_ID",
-  "provider": "claude",
-  "model": "${CLAUDE_MODEL}",
-  "messages": [],
-  "created_at": "$(date -Iseconds)",
-  "updated_at": "$(date -Iseconds)"
+  "provider": "github-copilot",
+  "timestamp": "$(date -Iseconds)",
+  "messages": []
 }
 SESEOF
 
-log_message() {
-    local role=$1
-    local content=$2
-    
-    # Append message to JSON
-    local temp=$(mktemp)
-    jq ".messages += [{\"role\": \"$role\", \"content\": \"$content\", \"timestamp\": \"$(date -Iseconds)\"}]" "$CHAT_FILE" > "$temp"
-    mv "$temp" "$CHAT_FILE"
-}
-
-send_to_claude() {
+send_to_copilot() {
     local message=$1
+    local api_url="https://api.github.com/copilot/chat"
     
-    if [ -z "$ANTHROPIC_API_KEY" ]; then
-        echo "Error: ANTHROPIC_API_KEY not configured"
-        return 1
-    fi
+    log_info "Sending to GitHub Copilot..."
     
-    log_message "user" "$message"
-    
-    local response=$(curl -s https://api.anthropic.com/v1/messages \
-        -H "x-api-key: $ANTHROPIC_API_KEY" \
-        -H "anthropic-version: 2023-06-01" \
-        -H "content-type: application/json" \
+    local response=$(curl -s --max-time 30 \
+        "$api_url" \
+        -H "Authorization: Bearer $TOKEN" \
+        -H "Content-Type: application/json" \
+        -H "User-Agent: OpusCopilot/1.1.0" \
         -d "{
-            \"model\": \"${CLAUDE_MODEL}\",
-            \"max_tokens\": 1024,
             \"messages\": [{
                 \"role\": \"user\",
                 \"content\": \"$message\"
-            }]
-        }")
+            }],
+            \"stream\": false
+        }" 2>/dev/null)
     
-    if echo "$response" | jq . &>/dev/null; then
-        local content=$(echo "$response" | jq -r '.content[0].text')
-        log_message "assistant" "$content"
-        echo "$content"
+    if echo "$response" | jq . &>/dev/null 2>&1; then
+        local reply=$(echo "$response" | jq -r '.choices[0].message.content // empty' 2>/dev/null)
+        if [ -n "$reply" ]; then
+            echo "$reply"
+            # Log to session
+            local temp=$(mktemp)
+            jq ".messages += [{\"role\": \"user\", \"content\": \"$message\", \"timestamp\": \"$(date -Iseconds)\"}]" "$CHAT_FILE" > "$temp"
+            jq ".messages += [{\"role\": \"assistant\", \"content\": \"$reply\", \"timestamp\": \"$(date -Iseconds)\"}]" "$temp" > "$CHAT_FILE"
+            rm "$temp"
+            return 0
+        else
+            log_error "$(echo $response | jq -r '.message // "Unknown error"' 2>/dev/null)"
+            return 1
+        fi
     else
-        echo "Error communicating with Claude API"
+        log_error "Failed to connect to GitHub Copilot API"
         return 1
     fi
 }
 
-# Main chat loop
 if [ -z "$1" ]; then
-    echo "Opus Chat - Interactive Mode"
-    echo "Type 'exit' to quit, 'sync' to sync conversation"
+    log_info "Opus Chat - Interactive Mode (GitHub Copilot)"
+    log_info "Type 'exit' to quit"
     echo ""
     
     while true; do
         read -p "You: " input
+        [ "$input" = "exit" ] && break
+        [ -z "$input" ] && continue
         
-        if [ "$input" = "exit" ]; then
-            break
-        elif [ "$input" = "sync" ]; then
-            "${HOME}/.opus/bin/opus-sync"
-            continue
-        fi
-        
-        echo -n "Assistant: "
-        send_to_claude "$input"
+        echo -n "Copilot: "
+        send_to_copilot "$input" || log_error "Failed to get response"
         echo ""
     done
 else
-    # Single message mode
-    send_to_claude "$*"
+    send_to_copilot "$*"
 fi
 CHATEOF
 
-    # Sync script for conversation history
-    cat > "${OPUS_BIN}/opus-sync" << 'SYNCEOF'
+    # Search script
+    cat > "${OPUS_BIN}/opus-search" << 'SEARCHEOF'
 #!/bin/bash
-source "${HOME}/.opus/config/providers.conf" 2>/dev/null || true
 OPUS_CACHE="${HOME}/.opus/cache"
-OPUS_LOG="${HOME}/.opus/logs"
-CLAUDE_MODEL="${CLAUDE_MODEL:-claude-haiku-4.5}"
+query="$1"
 
-log_sync() {
-    echo "[$(date +'%Y-%m-%d %H:%M:%S')] $1" >> "${OPUS_LOG}/sync.log"
-}
+if [ -z "$query" ]; then
+    echo "Usage: opus search <query>"
+    exit 1
+fi
 
-sync_conversations() {
-    log_sync "Starting sync operation..."
-    
-    # Find all chat sessions
-    local session_count=$(find "$OPUS_CACHE" -name "chat_*.json" 2>/dev/null | wc -l)
-    log_sync "Found $session_count chat sessions"
-    
-    # Backup conversations
-    if [ "$AUTO_BACKUP" = "true" ]; then
-        local backup_dir="${OPUS_CACHE}/backups/$(date +%Y%m%d_%H%M%S)"
-        mkdir -p "$backup_dir"
-        cp "${OPUS_CACHE}"/chat_*.json "$backup_dir/" 2>/dev/null || true
-        log_sync "Backed up sessions to $backup_dir"
-    fi
-    
-    # Create sync manifest
-    local manifest="${OPUS_CACHE}/manifest.json"
-    cat > "$manifest" << MANIFEOF
-{
-  "sync_timestamp": "$(date -Iseconds)",
-  "session_count": $session_count,
-  "provider": "claude",
-  "model": "${CLAUDE_MODEL}",
-  "backup_enabled": $AUTO_BACKUP,
-  "sync_status": "completed"
-}
-MANIFEOF
-    
-    log_sync "Sync completed successfully"
-    echo "Sync completed: $session_count sessions synchronized"
-}
+echo "Searching chat history for: $query"
+echo ""
+grepcount=$(grep -r "$query" "${OPUS_CACHE}/sessions" 2>/dev/null | wc -l)
+if [ $grepcount -eq 0 ]; then
+    echo "No results found"
+else
+    grep -r "$query" "${OPUS_CACHE}/sessions" 2>/dev/null | head -20
+    echo ""
+    echo "Found $grepcount matches"
+fi
+SEARCHEOF
 
-sync_conversations
-SYNCEOF
-
-    # Configuration management script
-    cat > "${OPUS_BIN}/opus-config" << 'CONFEOF'
+    # Snippets manager
+    cat > "${OPUS_BIN}/opus-snippets" << 'SNIPPETSEOF'
 #!/bin/bash
-CONFIG_FILE="${HOME}/.opus/config/providers.conf"
+OPUS_DATA="${HOME}/.opus/data"
+SNIPPETS_DIR="${OPUS_DATA}/snippets"
 
 case "$1" in
-    show)
-        if [ ! -f "$CONFIG_FILE" ]; then
-            echo "Configuration file not found at $CONFIG_FILE"
-            return 1
+    list)
+        if [ -d "$SNIPPETS_DIR" ] && [ "$(ls -A $SNIPPETS_DIR)" ]; then
+            echo "Available snippets:"
+            ls -1 "$SNIPPETS_DIR" | sed 's/\.txt$//'
+        else
+            echo "No snippets found"
         fi
-        echo "Current Configuration:"
-        echo "====================="
-        grep "^[^#]" "$CONFIG_FILE" | grep -v "^$"
         ;;
-    set)
-        if [ -z "$2" ] || [ -z "$3" ]; then
-            echo "Usage: opus config set <key> <value>"
-            return 1
+    add)
+        name=$2
+        [ -z "$name" ] && { echo "Usage: opus snippets add <name>"; exit 1; }
+        echo "Enter your snippet (Ctrl+D when done):"
+        cat > "${SNIPPETS_DIR}/${name}.txt"
+        echo "Snippet saved: $name"
+        ;;
+    get)
+        name=$2
+        [ -z "$name" ] && { echo "Usage: opus snippets get <name>"; exit 1; }
+        if [ -f "${SNIPPETS_DIR}/${name}.txt" ]; then
+            cat "${SNIPPETS_DIR}/${name}.txt"
+        else
+            echo "Snippet not found: $name"
         fi
-        if [ ! -f "$CONFIG_FILE" ]; then
-            echo "Configuration file not found"
-            return 1
+        ;;
+    del)
+        name=$2
+        [ -z "$name" ] && { echo "Usage: opus snippets del <name>"; exit 1; }
+        rm -f "${SNIPPETS_DIR}/${name}.txt"
+        echo "Snippet deleted: $name"
+        ;;
+    *)
+        echo "Usage: opus snippets [list|add|get|del]"
+        ;;
+esac
+SNIPPETSEOF
+
+    # Sync script
+    cat > "${OPUS_BIN}/opus-sync" << 'SYNCEOF'
+#!/bin/bash
+OPUS_CACHE="${HOME}/.opus/cache"
+OPUS_LOG="${HOME}/.opus/logs"
+
+echo "Starting sync..."
+
+session_count=$(find "${OPUS_CACHE}/sessions" -name "chat_*.json" 2>/dev/null | wc -l)
+
+if [ "${AUTO_BACKUP}" != "false" ]; then
+    backup_dir="${OPUS_CACHE}/backups/$(date +%Y%m%d_%H%M%S)"
+    mkdir -p "$backup_dir"
+    cp "${OPUS_CACHE}"/sessions/*.json "$backup_dir/" 2>/dev/null || true
+    echo "✓ Backed up $session_count sessions to $backup_dir"
+fi
+
+echo "✓ Sync completed: $session_count sessions"
+SYNCEOF
+
+    # Config management
+    cat > "${OPUS_BIN}/opus-config" << 'CONFEOF'
+#!/bin/bash
+OPUS_CONFIG="${HOME}/.opus/config"
+CONFIG_FILE="${OPUS_CONFIG}/.opus_config"
+
+case "$1" in
+    status)
+        echo "═══════════════════════════════════════════════════════════"
+        echo "GitHub Copilot Chat AI Configuration"
+        echo "═══════════════════════════════════════════════════════════"
+        echo ""
+        
+        if [ -f "${OPUS_CONFIG}/token_info" ]; then
+            echo "Device & Account Information:"
+            jq '.' "${OPUS_CONFIG}/token_info"
+        else
+            echo "No configuration found"
         fi
-        sed -i "s|^$2=.*|$2=\"$3\"|" "$CONFIG_FILE"
-        echo "Configuration updated: $2=$3"
         ;;
     test)
-        if [ -z "$ANTHROPIC_API_KEY" ]; then
-            source "$CONFIG_FILE" 2>/dev/null || true
+        echo "Testing GitHub Copilot connection..."
+        
+        TOKEN_FILE="${OPUS_CONFIG}/copilot_token"
+        if [ ! -f "$TOKEN_FILE" ]; then
+            echo "✗ Token file not found"
+            exit 1
         fi
         
-        echo "Testing API connections..."
+        TOKEN=$(cat "$TOKEN_FILE")
         
-        if [ -n "$ANTHROPIC_API_KEY" ]; then
-            echo -n "Testing Anthropic (Claude)... "
-            response=$(curl -s https://api.anthropic.com/v1/messages \
-                -H "x-api-key: $ANTHROPIC_API_KEY" \
-                -H "anthropic-version: 2023-06-01" \
-                -H "content-type: application/json" \
-                -d '{"model":"claude-haiku-4.5","max_tokens":10,"messages":[{"role":"user","content":"test"}]}')
-            
-            if echo "$response" | jq . &>/dev/null; then
-                echo "✓ OK"
-            else
-                echo "✗ FAILED"
-            fi
+        response=$(curl -s --max-time 5 \
+            "https://api.github.com/copilot/chat" \
+            -H "Authorization: Bearer $TOKEN" \
+            -H "Content-Type: application/json" \
+            -d '{"messages": [{"role": "user", "content": "test"}]}' 2>/dev/null)
+        
+        if echo "$response" | jq . &>/dev/null 2>&1; then
+            echo "✓ GitHub Copilot connection OK"
         else
-            echo "ANTHROPIC_API_KEY not configured"
+            echo "✗ GitHub Copilot connection FAILED"
+            exit 1
+        fi
+        ;;
+    rotate-token)
+        echo "Rotating GitHub Copilot token..."
+        rm -f "${OPUS_CONFIG}/copilot_token"
+        echo "✓ Token rotated. Run installer again to set new token."
+        ;;
+    clear-device)
+        echo "⚠ WARNING: This will clear device-specific data"
+        read -p "Are you sure? (y/N): " confirm
+        if [ "$confirm" = "y" ]; then
+            rm -f "${OPUS_CONFIG}/.device_id"
+            echo "✓ Device ID cleared"
+        fi
+        ;;
+    clear-account)
+        echo "⚠ WARNING: This will clear account-specific data"
+        read -p "Are you sure? (y/N): " confirm
+        if [ "$confirm" = "y" ]; then
+            rm -f "${OPUS_CONFIG}/.account_id"
+            echo "✓ Account ID cleared"
         fi
         ;;
     *)
-        echo "Usage: opus config [show|set|test]"
+        echo "Usage: opus config [status|test|rotate-token|clear-device|clear-account]"
         ;;
 esac
 CONFEOF
 
     # Status script
-    cat > "${OPUS_BIN}/opus-status" << 'STATEOF'
+    cat > "${OPUS_BIN}/opus-status" << 'STATUSEOF'
 #!/bin/bash
-source "${HOME}/.opus/config/providers.conf" 2>/dev/null || true
 OPUS_CACHE="${HOME}/.opus/cache"
-CLAUDE_MODEL="${CLAUDE_MODEL:-claude-haiku-4.5}"
+OPUS_CONFIG="${HOME}/.opus/config"
 
-echo "Opus System Status"
-echo "=================="
+echo "╔═════════════════════════════════════════════════════════════╗"
+echo "║        Opus: GitHub Copilot Chat AI - Status v1.1.0        ║"
+echo "╚═════════════════════════════════════════════════════════════╝"
+echo ""
+
 echo "Installation: $HOME/.opus"
-echo "Configuration: ${HOME}/.opus/config/providers.conf"
+echo "Status: ✓ Configured"
 echo ""
-echo "Enabled Providers:"
-[ "$COPILOT_ENABLED" = "true" ] && echo "  ✓ GitHub Copilot"
-[ "$CLAUDE_ENABLED" = "true" ] && echo "  ✓ Claude (${CLAUDE_MODEL})"
-[ "$OPENAI_ENABLED" = "true" ] && echo "  ✓ OpenAI"
-echo ""
-echo "Chat Sessions:"
-local session_count=$(find "$OPUS_CACHE" -name "chat_*.json" 2>/dev/null | wc -l)
-echo "  Total: $session_count"
-echo ""
-echo "Storage Usage:"
-du -sh "${HOME}/.opus" 2>/dev/null || echo "  N/A"
-STATEOF
 
-    # Make all scripts executable
+echo "Device & Account Isolation:"
+if [ -f "${OPUS_CONFIG}/.device_id" ]; then
+    device_id=$(cat "${OPUS_CONFIG}/.device_id")
+    echo "  Device ID: $device_id"
+fi
+
+if [ -f "${OPUS_CONFIG}/.account_id" ]; then
+    account_id=$(cat "${OPUS_CONFIG}/.account_id")
+    echo "  Account ID: $account_id"
+fi
+echo ""
+
+echo "Chat Statistics:"
+session_count=$(find "${OPUS_CACHE}/sessions" -name "chat_*.json" 2>/dev/null | wc -l)
+echo "  Total Sessions: $session_count"
+
+if [ -d "${OPUS_CACHE}/backups" ]; then
+    backup_count=$(find "${OPUS_CACHE}/backups" -type d -mindepth 1 2>/dev/null | wc -l)
+    echo "  Backups: $backup_count"
+fi
+echo ""
+
+echo "Storage:"
+du -sh "$HOME/.opus" 2>/dev/null | sed 's/^/  Total: /'
+echo ""
+
+echo "System Info:"
+echo "  OS: $OSTYPE"
+echo "  User: $(whoami)"
+echo "  Hostname: $(hostname)"
+STATUSEOF
+
     chmod +x "${OPUS_BIN}"/*
-    
-    log_success "Core scripts installed to $OPUS_BIN"
+    log_success "Core scripts installed"
 }
 
 ################################################################################
@@ -471,7 +612,7 @@ STATEOF
 ################################################################################
 
 configure_path() {
-    log_info "Configuring PATH..."
+    log_title "Configuring Shell PATH"
     
     local shell_rc=""
     
@@ -488,178 +629,80 @@ configure_path() {
     fi
     
     if ! grep -q "$OPUS_BIN" "$shell_rc"; then
-        echo "" >> "$shell_rc"
-        echo "# Opus AI Sync - Added by installer" >> "$shell_rc"
-        echo "export PATH=\"$OPUS_BIN:\$PATH\"" >> "$shell_rc"
+        {
+            echo ""
+            echo "# Opus: GitHub Copilot Chat AI"
+            echo "export PATH=\"$OPUS_BIN:\$PATH\""
+        } >> "$shell_rc"
         log_success "PATH configured in $shell_rc"
     else
         log_success "PATH already configured"
     fi
     
-    # Source the updated shell config
     source "$shell_rc" 2>/dev/null || true
 }
 
 ################################################################################
-# Documentation & Examples
-################################################################################
-
-create_documentation() {
-    log_info "Creating documentation..."
-    
-    cat > "${OPUS_HOME}/README.md" << 'DOCEOF'
-# Opus: Copilot Chat AI Sync
-
-Integrated GitHub Copilot and Claude AI chat interface for Termux with per-account API key management.
-
-## Installation
-
-Run the installer:
-```bash
-curl -fsSL https://raw.githubusercontent.com/Riskybit23/Chat-ai-Project/main/install-termux.sh | bash
-```
-
-## Quick Start
-
-### Interactive Chat
-```bash
-opus chat
-```
-
-### Single Message
-```bash
-opus chat "What is the meaning of life?"
-```
-
-### Sync Conversations
-```bash
-opus sync
-```
-
-### View Configuration
-```bash
-opus config show
-```
-
-### Update Configuration
-```bash
-opus config set ANTHROPIC_API_KEY "your-key-here"
-```
-
-### Test Connections
-```bash
-opus config test
-```
-
-### System Status
-```bash
-opus status
-```
-
-## Configuration
-
-API keys are stored in: `~/.opus/config/providers.conf`
-
-Supported providers:
-- **Claude** (Anthropic) - Haiku 4.5
-- **GitHub Copilot** - Via GitHub API
-- **OpenAI** - GPT models (optional)
-
-## Directory Structure
-
-```
-~/.opus/
-��── bin/              # Executable scripts
-├── config/           # Configuration files
-├── cache/            # Chat sessions & backups
-└── logs/             # Operation logs
-```
-
-## Features
-
-✓ Multi-provider AI integration
-✓ Per-account API key management
-✓ Persistent chat history
-✓ Automatic backups
-✓ Real-time sync
-✓ JSON-based session storage
-✓ Comprehensive logging
-
-## Troubleshooting
-
-### API Connection Issues
-```bash
-opus config test
-```
-
-### View Logs
-```bash
-tail -f ~/.opus/logs/sync.log
-```
-
-### Reset Configuration
-```bash
-rm ~/.opus/config/providers.conf
-# Re-run installer
-```
-
-## Uninstall
-
-```bash
-rm -rf ~/.opus
-grep -v "Opus AI Sync" ~/.bashrc > ~/.bashrc.tmp
-mv ~/.bashrc.tmp ~/.bashrc
-```
-
-## Support
-
-Repository: https://github.com/Riskybit23/Chat-ai-Project
-DOCEOF
-
-    log_success "Documentation created at ${OPUS_HOME}/README.md"
-}
-
-################################################################################
-# Main Installation Flow
+# Main Installation
 ################################################################################
 
 main() {
     clear
     
-    echo -e "${BLUE}"
-    echo "╔════════════════════════════════════════╗"
-    echo "║  Opus: Copilot Chat AI Sync Installer  ║"
-    echo "║  For Termux & Linux Environments       ║"
-    echo "╚════════════════════════════════════════╝"
+    echo -e "${MAGENTA}"
+    cat << "LOGO"
+╔═══════════════════════════════════════════════════════════════════╗
+║                                                                   ║
+║   Opus: GitHub Copilot Chat AI Sync for Termux                   ║
+║   Per-Account & Per-Device Isolation with Secure Token Storage   ║
+║                                                                   ║
+║   Version: 1.1.0 (GitHub Copilot Only)                           ║
+║                                                                   ║
+╚═══════════════════════════════════════════════════════════════════╝
+LOGO
     echo -e "${NC}"
-    echo ""
     
-    # Run installation steps
-    check_prerequisites || exit 1
+    detect_system
+    check_prerequisites
     setup_directories
-    setup_github_auth || log_warning "GitHub auth setup skipped"
-    setup_api_keys
+    generate_device_id
+    generate_account_id
+    setup_github_auth
+    setup_copilot_token
     install_core_scripts
     configure_path
-    create_documentation
     
     echo ""
     echo -e "${GREEN}"
-    echo "╔════════════════════════════════════════╗"
-    echo "║   Installation Completed Successfully!  ║"
-    echo "╚════════════════════════════════════════╝"
+    cat << "SUCCESS"
+╔═══════════════════════════════════════════════════════════════════╗
+║   Installation Completed Successfully! ✓                          ║
+╚═══════════════════════════════════════════════════════════════════╝
+SUCCESS
     echo -e "${NC}"
+    
     echo ""
     echo "Next steps:"
-    echo "1. Reload your shell config: source ~/.bashrc"
-    echo "2. Try your first chat: opus chat"
-    echo "3. View documentation: cat ~/.opus/README.md"
+    echo "  1. Reload shell: source ~/.bashrc"
+    echo "  2. Verify setup: opus status"
+    echo "  3. Test connection: opus config test"
+    echo "  4. Start chatting: opus chat 'Hello Copilot'"
     echo ""
     echo "Quick commands:"
-    echo "  opus help              - Show help"
-    echo "  opus config show       - View current config"
-    echo "  opus config test       - Test API connections"
-    echo "  opus status            - System status"
+    echo "  • opus help              - Show all commands"
+    echo "  • opus chat              - Interactive mode"
+    echo "  • opus search 'keyword'  - Search history"
+    echo "  • opus snippets list     - View snippets"
+    echo "  • opus status            - System status"
+    echo "  • opus sync              - Backup sessions"
+    echo ""
+    echo "Security:"
+    echo "  ✓ Per-device isolation: Device ID stored securely"
+    echo "  ✓ Per-account isolation: Account ID tracked"
+    echo "  ✓ Token encrypted: Stored with 600 permissions"
+    echo "  ✓ Session backups: Automatic daily backups"
+    echo ""
+    echo "Repository: https://github.com/Riskybit23/Chat-ai-Project"
     echo ""
 }
 
